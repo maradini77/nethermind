@@ -51,7 +51,7 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
     // Small optimization to not re-create CommitBuffer
     private CommitBuffer? _commitBufferUnused = null;
 
-    private bool IsInCommitBufferMode => _commitBuffer is not null;
+    internal bool IsInCommitBufferMode => _commitBuffer is not null;
 
     // Only one scope can be active at the same time. Any mutation to trieStore as part of block processing need to
     // acquire _scopeLock.
@@ -99,14 +99,22 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
         _dirtyNodes = new TrieStoreDirtyNodesCache[_shardedDirtyNodeCount];
         _dirtyNodesTasks = new Task[_shardedDirtyNodeCount];
         _persistedHashes = new ConcurrentDictionary<HashAndTinyPath, Hash256?>[_shardedDirtyNodeCount];
-        for (int i = 0; i < _shardedDirtyNodeCount; i++)
-        {
-            _dirtyNodes[i] = new TrieStoreDirtyNodesCache(this, !_nodeStorage.RequirePath, (_shardBit / 4) - 1, _logger);
-            _persistedHashes[i] = new ConcurrentDictionary<HashAndTinyPath, Hash256>();
-        }
-
         _deleteOldNodes = _pruningStrategy.DeleteObsoleteKeys;
         _pastKeyTrackingEnabled = pruningConfig.TrackPastKeys && nodeStorage.RequirePath;
+
+        int keepTopLevelNode = -1;
+        if (_pastKeyTrackingEnabled && _deleteOldNodes)
+        {
+            // Node of top level or equal to this is not pruned via memory pruning. This is to prevent not deleting top level
+            // nodes when child nodes was deleted. Also reduce chances of faulty state check.
+            keepTopLevelNode = (_shardBit / 4) - 1;
+        }
+
+        for (int i = 0; i < _shardedDirtyNodeCount; i++)
+        {
+            _dirtyNodes[i] = new TrieStoreDirtyNodesCache(this, !_nodeStorage.RequirePath, keepTopLevelNode, _logger);
+            _persistedHashes[i] = new ConcurrentDictionary<HashAndTinyPath, Hash256>();
+        }
     }
 
     public IScopedTrieStore GetTrieStore(Hash256? address) => new ScopedTrieStore(this, address);
@@ -234,7 +242,9 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
             if (IsInCommitBufferMode)
                 node = _commitBuffer.SaveOrReplaceInDirtyNodesCache(address, ref path, node, blockNumber);
             else
+            {
                 node = SaveOrReplaceInDirtyNodesCache(address, ref path, node, blockNumber);
+            }
 
             IncrementCommittedNodesCount();
         }
@@ -554,27 +564,29 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
         var state = CaptureCurrentState();
         if ((_pruningStrategy.ShouldPruneDirtyNode(state) || _pruningStrategy.ShouldPrunePersistedNode(state)) && _pruningTask.IsCompleted)
         {
-            _pruningTask = Task.Run(() =>
-            {
-                using (var _ = _pruningLock.EnterScope())
-                {
-                    if (_pruningStrategy.ShouldPruneDirtyNode(CaptureCurrentState()))
-                    {
-                        PersistAndPruneDirtyCache();
-                    }
-
-                    if (_pruningStrategy.ShouldPrunePersistedNode(CaptureCurrentState()))
-                    {
-                        PrunePersistedNodes();
-                    }
-                }
-
-                TryExitCommitBufferMode();
-            });
+            _pruningTask = Task.Run(SyncPruneCheck);
         }
     }
 
-    private void PersistAndPruneDirtyCache()
+    internal void SyncPruneCheck()
+    {
+        TryExitCommitBufferMode();
+
+        using (var _ = _pruningLock.EnterScope())
+        {
+            if (_pruningStrategy.ShouldPruneDirtyNode(CaptureCurrentState()))
+            {
+                PersistAndPruneDirtyCache();
+            }
+
+            if (_pruningStrategy.ShouldPrunePersistedNode(CaptureCurrentState()))
+            {
+                PrunePersistedNodes();
+            }
+        }
+    }
+
+    internal void PersistAndPruneDirtyCache()
     {
         try
         {
@@ -776,7 +788,7 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
     /// <summary>
     /// Only prune persisted nodes. This method attempt to pick only some shard for pruning.
     /// </summary>
-    private void PrunePersistedNodes()
+    internal void PrunePersistedNodes()
     {
         try
         {
@@ -1455,7 +1467,15 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
             _dirtyNodesBuffer = new TrieStoreDirtyNodesCache[trieStore._dirtyNodes.Length];
             for (int i = 0; i < trieStore._shardedDirtyNodeCount; i++)
             {
-                _dirtyNodesBuffer[i] = new TrieStoreDirtyNodesCache(trieStore, !trieStore._nodeStorage.RequirePath, 0, trieStore._logger);
+                _dirtyNodesBuffer[i] = new TrieStoreDirtyNodesCache(trieStore, !trieStore._nodeStorage.RequirePath, 0, trieStore._logger, isForCommitBuffer: true);
+            }
+        }
+
+        public void Reset()
+        {
+            for (int i = 0; i < _trieStore._shardedDirtyNodeCount; i++)
+            {
+                _dirtyNodesBuffer[i].Clear();
             }
         }
 
@@ -1470,13 +1490,12 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
             long startTime = Stopwatch.GetTimestamp();
             Parallel.For(0, _trieStore._shardedDirtyNodeCount, (i) =>
             {
-                _dirtyNodesBuffer[i].CopyTo(_trieStore._dirtyNodes[i]);
+                _dirtyNodesBuffer[i].FlushCommitBuffer(_trieStore._dirtyNodes[i]);
             });
 
             int count = 0;
             while (_commitSetQueueBuffer.TryDequeue(out BlockCommitSet commitSet))
             {
-                _trieStore._commitSetQueue.Enqueue(commitSet);
                 _trieStore.PushToMainCommitSetQueue(commitSet);
                 count++;
             }
@@ -1501,47 +1520,43 @@ public sealed class TrieStore : ITrieStore, IPruningTrieStore
             TrieStoreDirtyNodesCache mainShard = _trieStore._dirtyNodes[shardIdx];
 
             var hasInBuffer = bufferShard.TryGetValue(key, out TrieNode bufferNode);
+            if (isReadOnly)
+            {
+                if (hasInBuffer)
+                {
+                    return _trieStore.CloneForReadOnly(key, bufferNode);
+                }
+
+                return mainShard.FromCachedRlpOrUnknown(key);
+            }
+
             if (!hasInBuffer && mainShard.TryGetRecord(key, out TrieStoreDirtyNodesCache.NodeRecord nodeRecord))
             {
                 if (_trieStore.IsStillNeeded(nodeRecord.LastCommit))
                 {
-                    var rlp = nodeRecord.Node.FullRlp;
-                    if (rlp.IsNull)
-                    {
-                        bufferShard.GetOrAdd(key, nodeRecord);
-                        if (!isReadOnly) return nodeRecord.Node;
-                    }
-                    else
-                    {
-                        // clone is as if it read only
-                        TrieNode node = nodeRecord.Node.Clone();
-                        if (nodeRecord.Node.IsSealed) node.Seal();
-                        if (nodeRecord.Node.IsPersisted) node.IsPersisted = true;
-                        node.Keccak = nodeRecord.Node.Keccak;
-                        bufferShard.GetOrAdd(key, nodeRecord);
-                        if (!isReadOnly) return nodeRecord.Node;
-                    }
+                    bufferShard.GetOrAdd(key, new TrieStoreDirtyNodesCache.NodeRecord(nodeRecord.Node, -1));
+                    return nodeRecord.Node;
                 }
             }
 
             if (hasInBuffer)
             {
-                if (!isReadOnly)
-                {
-                    return bufferNode;
-                }
-                else
-                {
-                    return _trieStore.CloneForReadOnly(key, bufferNode);
-                }
+                return bufferNode;
             }
-
-            return isReadOnly ? bufferShard.FromCachedRlpOrUnknown(key) : bufferShard.FindCachedOrUnknown(key);
+            else
+                return bufferShard.FindCachedOrUnknown(key);
         }
     }
 
     internal TrieNode CloneForReadOnly(in TrieStoreDirtyNodesCache.Key key, TrieNode node)
     {
+        if (node!.FullRlp.IsNull)
+        {
+            // // this happens in SyncProgressResolver
+            // throw new InvalidAsynchronousStateException("Read only trie store is trying to read a transient node.");
+            return new TrieNode(NodeType.Unknown, key.Keccak);
+        }
+
         // we returning a copy to avoid multithreaded access
         var trieNode = new TrieNode(NodeType.Unknown, key.Keccak, node.FullRlp);
         trieNode.ResolveNode(GetTrieStore(key.Address), key.Path);
