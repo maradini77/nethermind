@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 
 set -e
+set -euo pipefail
 
-./nethermind "$@" 2>&1 &
-
-pid=$(pidof ./nethermind)
-
-#dotnet-trace collect -p $pid -o /nethermind/diag/dotnet.nettrace
-dottrace attach $pid --save-to=/nethermind/diag/dottrace --service-output=on --profiling-type=timeline
+exec dottrace run \
+  --save-to=/nethermind/diag/dottrace \
+  --profiling-type=timeline \
+  --service-output=on \
+  -- ./nethermind "$@"
