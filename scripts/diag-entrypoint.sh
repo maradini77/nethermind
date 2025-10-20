@@ -5,7 +5,7 @@
 set -e
 set -euo pipefail
 
-exec dottrace run \
+exec dottrace start \
   --save-to=/nethermind/diag/dottrace \
   --profiling-type=timeline \
   --service-output=on \
