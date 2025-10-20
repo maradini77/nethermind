@@ -7,7 +7,7 @@ set -euo pipefail
 
 exec dottrace start \
   --framework=NetCore \
-  --save-to=/nethermind/diag/dottrace \
+  --save-to=/nethermind/diag/dottrace/nethermind_$(date +%F_%H-%M-%S).dtt \
   --profiling-type=timeline \
   --service-output=on \
   --propagate-exit-code \
