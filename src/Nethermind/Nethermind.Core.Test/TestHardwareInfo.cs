@@ -6,4 +6,5 @@ namespace Nethermind.Core.Test;
 public class TestHardwareInfo(long availableMemory = 10000000) : IHardwareInfo
 {
     public long AvailableMemoryBytes => availableMemory;
+    public int? MaxOpenFilesLimit { get; }
 }
